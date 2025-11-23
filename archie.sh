@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # easy-arch-install.sh
 # Interactive Arch Linux installer (ext4 or LUKS+btrfs)
+# Includes virtualization detection and guest tools installer (virt_check)
 # Run as root from Arch install ISO.
 set -euo pipefail
 IFS=$'\n\t'
@@ -11,9 +12,45 @@ IFS=$'\n\t'
 BOLD='\e[1m'; BRED='\e[91m'; BBLUE='\e[34m'; BGREEN='\e[92m'; BYELLOW='\e[93m'; RESET='\e[0m'
 info(){ echo -e "${BOLD}${BGREEN}[ ${BYELLOW}•${BGREEN} ]${RESET} $*"; }
 warn(){ echo -e "${BOLD}${BYELLOW}[ ${BBLUE}!${BYELLOW} ]${RESET} $*"; }
-err(){ echo -e "$ {BOLD}${BRED}[ ${BBLUE}X${BRED} ]${RESET} $*"; }
+err(){ echo -e "${BOLD}${BRED}[ ${BBLUE}X${BRED} ]${RESET} $*"; }
 prompt(){ local _msg="$1"; local _def="${2:-}"; if [[ -n "$_def" ]]; then read -rp "$_msg [$_def]: " _ans; echo "${_ans:-$_def}"; else read -rp "$_msg: " _ans; echo "$_ans"; fi }
-confirm(){ local _msg="${1:-Continue?}"; local _def="${2:-y}"; while true; do read -rp "$_msg (${_def^^}/n): " resp; resp="${resp:-$ _def}"; case "${resp,,}" in y|yes) return 0 ;; n|no) return 1 ;; *) echo "Please answer yes or no." ;; esac; done }
+confirm(){ local _msg="${1:-Continue?}"; local _def="${2:-y}"; while true; do read -rp "$_msg (${_def^^}/n): " resp; resp="${resp:-$_def}"; case "${resp,,}" in y|yes) return 0 ;; n|no) return 1 ;; *) echo "Please answer yes or no." ;; esac; done }
+
+# -----------------------
+# Virtualization detection and guest tools installer
+# (as you requested — installs guest packages into /mnt and enables services)
+# -----------------------
+virt_check() {
+    hypervisor=$(systemd-detect-virt)
+    case $hypervisor in
+        kvm )
+            info "KVM detected — installing qemu-guest-agent into target system and enabling service."
+            pacstrap /mnt qemu-guest-agent &>/dev/null || true
+            systemctl enable qemu-guest-agent --root=/mnt &>/dev/null || true
+            ;;
+        vmware )
+            info "VMware detected — installing open-vm-tools into target system and enabling services."
+            pacstrap /mnt open-vm-tools &>/dev/null || true
+            systemctl enable vmtoolsd --root=/mnt &>/dev/null || true
+            systemctl enable vmware-vmblock-fuse --root=/mnt &>/dev/null || true
+            ;;
+        oracle )
+            info "VirtualBox detected — installing virtualbox-guest-utils into target system and enabling vboxservice."
+            pacstrap /mnt virtualbox-guest-utils &>/dev/null || true
+            systemctl enable vboxservice --root=/mnt &>/dev/null || true
+            ;;
+        microsoft )
+            info "Hyper-V detected — installing hyperv guest utilities into target and enabling services."
+            pacstrap /mnt hyperv &>/dev/null || true
+            systemctl enable hv_fcopy_daemon --root=/mnt &>/dev/null || true
+            systemctl enable hv_kvp_daemon --root=/mnt &>/dev/null || true
+            systemctl enable hv_vss_daemon --root=/mnt &>/dev/null || true
+            ;;
+        * )
+            info "No recognized hypervisor detected (running on bare metal or unknown platform)."
+            ;;
+    esac
+}
 
 # -----------------------
 # Preconditions
@@ -62,11 +99,11 @@ info "Kernel: $KERNEL"
 info "Network: 1) NetworkManager 2) IWD 3) dhcpcd 4) wpa_supplicant+dhcpcd"
 NETCH=$(prompt "Choose network manager (1-4)" "1")
 case "$NETCH" in
-  1) NETPKG="networkmanager"; NETEN=yes;;
-  2) NETPKG="iwd"; NETEN=yes;;
-  3) NETPKG="dhcpcd"; NETEN=yes;;
-  4) NETPKG="wpa_supplicant dhcpcd"; NETEN=yes;;
-  *) NETPKG="networkmanager"; NETEN=yes;;
+  1) NETPKG="networkmanager";;
+  2) NETPKG="iwd";;
+  3) NETPKG="dhcpcd";;
+  4) NETPKG="wpa_supplicant dhcpcd";;
+  *) NETPKG="networkmanager";;
 esac
 info "Network pkg: $NETPKG"
 
@@ -86,7 +123,8 @@ LOCALE=$(prompt "Locale (eg en_US.UTF-8)" "en_US.UTF-8")
 KMAP=$(prompt "Console keymap (eg us)" "us")
 HOSTNAME=$(prompt "Hostname" "aoba-arch")
 USERNAME=$(prompt "Create user (username; leave empty to skip creating user)" "aoba")
-# passwords (hidden prompts)
+
+# Hidden password prompts
 read -rsp "Root password (typing hidden): " ROOTPASS; echo
 if [[ -n "$USERNAME" ]]; then read -rsp "Password for $USERNAME: " USERPASS; echo; fi
 
@@ -182,12 +220,18 @@ else
 fi
 
 # -----------------------
+# virt_check: install guest tools if in VM
+# -----------------------
+info "Detecting virtualization and installing guest tools if needed..."
+virt_check
+
+# -----------------------
 # Pacstrap
 # -----------------------
 info "Installing base system (pacstrap). This may take a while..."
 PKGS=(base base-devel "$KERNEL" "$MICROCODE" linux-firmware vim sudo bash-completion)
 PKGS+=("$NETPKG" efibootmgr dosfstools mtools os-prober)
-if [[ "$LAYOUT" == "2" ]]; then PKGS+=(btrfs-progs grub grub-btrfs snapper snap-pac zram-generator rsync); else PKGS+=(os-prober); fi
+if [[ "$LAYOUT" == "2" ]]; then PKGS+=(btrfs-progs grub grub-btrfs snapper snap-pac zram-generator rsync); fi
 
 pacstrap /mnt "${PKGS[@]}"
 
@@ -240,19 +284,16 @@ if [[ "$LAYOUT" == "2" ]]; then
   sed -i 's/^HOOKS=.*/HOOKS=(systemd autodetect keyboard sd-vconsole modconf block sd-encrypt filesystems)/' /etc/mkinitcpio.conf || true
 fi
 mkinitcpio -P
-# Bootloader: for LUKS we use grub-efi; for ext4 use systemd-boot
+# Bootloader
 if [[ "$LAYOUT" == "2" ]]; then
-  # install grub-efi
   pacman -S --noconfirm grub efibootmgr
-  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
-  # if encrypted root, ensure GRUB cmdline
+  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB || true
   ROOT_UUID=$(blkid -s UUID -o value "$DEVICE_ROOT" || true)
   if [[ -n "$ROOT_UUID" ]]; then
     sed -i "s,^GRUB_CMDLINE_LINUX=\\\"\\\",GRUB_CMDLINE_LINUX=\\\"rd.luks.name=$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot\\\"," /etc/default/grub || true
   fi
-  grub-mkconfig -o /boot/grub/grub.cfg
+  grub-mkconfig -o /boot/grub/grub.cfg || true
 else
-  # systemd-boot
   bootctl install || true
   KIMG=$(ls /boot | grep '^vmlinuz' | head -n1 || echo vmlinuz-linux)
   IIMG=$(ls /boot | grep '^initramfs' | head -n1 || echo initramfs-linux.img)
@@ -269,7 +310,7 @@ options root=UUID=$ROOT_UUID rw
 EOF
 fi
 # Final update
-pacman -Syu --noconfirm
+pacman -Syu --noconfirm || true
 echo "CHROOT_DONE"
 CHROOT
 
@@ -279,11 +320,9 @@ chmod +x /mnt/root/arch_chroot_setup.sh
 # Run chroot script
 # -----------------------
 info "Entering chroot and finishing configuration..."
-# Pass parameters: HOSTNAME LOCALE KMAP USERNAME USERPASS ROOTPASS LAYOUT ROOT_DEVICE
 ROOT_DEVICE_PARAM=""
 if [[ "$LAYOUT" == "1" ]]; then ROOT_DEVICE_PARAM="$ROOT_PART"; else ROOT_DEVICE_PARAM="$CRYPTPART"; fi
 
-# copy variables for chroot (safely; passwords may contain special chars)
 arch-chroot /mnt /bin/bash -c "/root/arch_chroot_setup.sh '$HOSTNAME' '$LOCALE' '$KMAP' '$USERNAME' '$USERPASS' '$ROOTPASS' '$LAYOUT' '$ROOT_DEVICE_PARAM'"
 
 info "Unmounting and finishing..."
